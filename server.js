@@ -10,9 +10,7 @@ const admin = require("firebase-admin"); // npm install firebase-admin
 // → Service Accounts → Generate new private key
 // Save it as serviceAccountKey.json in the same folder as server.js
 // NEVER commit this file to git — add it to .gitignore
-const serviceAccount = process.env.FIREBASE_KEY
-  ? JSON.parse(process.env.FIREBASE_KEY)
-  : require("./serviceAccountKey.json");
+const serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
