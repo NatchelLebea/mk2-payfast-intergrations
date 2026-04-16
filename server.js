@@ -12,8 +12,10 @@ const admin = require("firebase-admin"); // npm install firebase-admin
 // NEVER commit this file to git — add it to .gitignore
 const serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
 
-// 🔥 VERY IMPORTANT FIX
-serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, "\n");
+// 🔥 FIX: convert \\n → real new lines
+serviceAccount.private_key = serviceAccount.private_key
+  .replace(/\\n/g, "\n")
+  .replace(/\r/g, "");
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
