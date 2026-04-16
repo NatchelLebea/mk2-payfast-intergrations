@@ -10,18 +10,14 @@ const admin = require("firebase-admin"); // npm install firebase-admin
 // → Service Accounts → Generate new private key
 // Save it as serviceAccountKey.json in the same folder as server.js
 // NEVER commit this file to git — add it to .gitignore
-let serviceAccount;
+const serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
 
-try {
-  serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
-} catch (err) {
-  console.error("❌ FIREBASE KEY PARSE ERROR:", err.message);
-  process.exit(1); // crash clearly instead of silently
-}
+// 🔥 VERY IMPORTANT FIX
+serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, "\n");
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
-  databaseURL: "https://gym-pro-20ee6-default-rtdb.europe-west1.firebasedatabase.app"
+  databaseURL: process.env.FIREBASE_DATABASE_URL,
 });
 //const db = admin.firestore();
 // If you use Realtime Database instead of Firestore, swap to:
