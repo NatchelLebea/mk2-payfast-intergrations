@@ -8,24 +8,9 @@ const rateLimit = require("express-rate-limit");
 const helmet    = require("helmet");
 const nodemailer = require("nodemailer");
 
-// ─── Firebase Admin ───────────────────────────────────────────────────────────
-let serviceAccount;
-
-if (process.env.FIREBASE_KEY) {
-  serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
-
-  // 🔥 CRITICAL FIX
-  serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
-
-} else {
-  throw new Error("Missing FIREBASE_KEY env variable");
-}
-
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-  databaseURL: process.env.FIREBASE_DATABASE_URL,
-});
-const db = admin.database();
+// ─── Firebase Admin (initialised asynchronously after server starts) ──────────
+let db = null;
+let firebaseReady = false;
 
 // ─── App ──────────────────────────────────────────────────────────────────────
 const app = express();
@@ -119,6 +104,15 @@ function generateSignature(data, passphrase = "") {
   return crypto.createHash("md5").update(str).digest("hex");
 }
 
+// ─── Firebase readiness guard ─────────────────────────────────────────────────
+function requireFirebase(res) {
+  if (!firebaseReady || !db) {
+    res.status(503).json({ error: "Service temporarily unavailable — database not ready yet" });
+    return false;
+  }
+  return true;
+}
+
 // ─── Find user ────────────────────────────────────────────────────────────────
 async function findUserRef(userId, email) {
   if (userId) {
@@ -208,6 +202,11 @@ app.post("/api/payfast-itn", async (req, res) => {
 
   const data = req.body;
   console.log("📩 ITN received:", JSON.stringify(data));
+
+  if (!firebaseReady || !db) {
+    console.error("ITN received but Firebase is not ready — skipping DB update");
+    return;
+  }
 
   try {
     // Security 1: IP whitelist
@@ -399,6 +398,7 @@ If the issue continues, your subscription may be cancelled.
 app.post("/api/cancel-subscription", cancelLimiter, async (req, res) => {
   const { userId } = req.body;
   if (!userId) return res.status(400).json({ error: "userId required" });
+  if (!requireFirebase(res)) return;
 
   try {
     const snap = await db.ref(`mk2_users/${userId}`).get();
@@ -514,23 +514,48 @@ function nextMonthFirst() {
 
 // ─── Health check ─────────────────────────────────────────────────────────────
 app.get("/health", (_, res) => res.json({
-  ok:   true,
-  mode: IS_LIVE ? "live" : "dev",
-  base: BASE_URL,
+  ok:       true,
+  firebase: firebaseReady,
+  mode:     IS_LIVE ? "live" : "dev",
+  base:     BASE_URL,
 }));
-
-
-// ─── Start ────────────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 5000;
-console.log("PORT FROM ENV:", process.env.PORT);
 
 app.get("/", (_, res) => {
   res.send("Server is running 🚀");
 });
+
+// ─── Start ────────────────────────────────────────────────────────────────────
+const PORT = process.env.PORT || 8080;
+console.log("PORT FROM ENV:", process.env.PORT);
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`\n🚀 Server on port ${PORT} [${IS_LIVE ? "LIVE" : "dev"}]`);
   console.log(`🔔 ITN:    ${BASE_URL}/api/payfast-itn`);
   console.log(`🔑 Sign:   ${BASE_URL}/api/payfast-sign`);
   console.log(`❌ Cancel: ${BASE_URL}/api/cancel-subscription\n`);
+
+  // ─── Firebase initialisation (async, after server is already listening) ────
+  (async () => {
+    try {
+      if (!process.env.FIREBASE_KEY) {
+        console.error("⚠️  Missing FIREBASE_KEY env variable — Firebase disabled");
+        return;
+      }
+
+      const serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
+      // Normalise escaped newlines that some env providers encode
+      serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, "\n");
+
+      admin.initializeApp({
+        credential:  admin.credential.cert(serviceAccount),
+        databaseURL: process.env.FIREBASE_DATABASE_URL,
+      });
+
+      db = admin.database();
+      firebaseReady = true;
+      console.log("🔥 Firebase initialised successfully");
+    } catch (err) {
+      console.error("🔥 Firebase initialisation failed — app continues without it:", err.message);
+    }
+  })();
 });
