@@ -1,368 +1,536 @@
 require("dotenv").config();
-const express = require("express");
-const crypto = require("crypto");
-const cors = require("cors");
-const axios = require("axios"); // npm install axios
-const admin = require("firebase-admin"); // npm install firebase-admin
+const express   = require("express");
+const crypto    = require("crypto");
+const cors      = require("cors");
+const axios     = require("axios");
+const admin     = require("firebase-admin");
+const rateLimit = require("express-rate-limit");
+const helmet    = require("helmet");
+const nodemailer = require("nodemailer");
 
-// ── Firebase Admin init ───────────────────────────────────────────────────────
-// Download your service account key from Firebase Console → Project Settings
-// → Service Accounts → Generate new private key
-// Save it as serviceAccountKey.json in the same folder as server.js
-// NEVER commit this file to git — add it to .gitignore
-const serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
+// ─── Firebase Admin ───────────────────────────────────────────────────────────
+let serviceAccount;
 
-// 🔥 FIX: convert \\n → real new lines
-serviceAccount.private_key = serviceAccount.private_key
-  .replace(/\\n/g, "\n")
-  .replace(/\r/g, "");
+if (process.env.FIREBASE_KEY) {
+  serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
+
+  // 🔥 CRITICAL FIX
+  serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
+
+} else {
+  throw new Error("Missing FIREBASE_KEY env variable");
+}
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
   databaseURL: process.env.FIREBASE_DATABASE_URL,
 });
-//const db = admin.firestore();
-// If you use Realtime Database instead of Firestore, swap to:
 const db = admin.database();
 
+// ─── App ──────────────────────────────────────────────────────────────────────
 const app = express();
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
+app.use(helmet());
 
-// ── Config ────────────────────────────────────────────────────────────────────
-// Set all of these in your .env file — never hardcode secrets
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
+  .split(",").map(o => o.trim()).filter(Boolean);
+
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin && process.env.NODE_ENV !== "production") return cb(null, true);
+    if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    cb(new Error(`CORS blocked: ${origin}`));
+  },
+  methods: ["GET", "POST", "PUT"],
+  allowedHeaders: ["Content-Type"],
+}));
+
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: "10kb" }));
+
+// ─── Rate limiters ────────────────────────────────────────────────────────────
+const signLimiter   = rateLimit({ windowMs: 60_000, max: 20, message: { error: "Too many requests." } });
+const cancelLimiter = rateLimit({ windowMs: 60_000, max: 5,  message: { error: "Too many requests." } });
+
+// ─── Config ───────────────────────────────────────────────────────────────────
 const {
   PAYFAST_MERCHANT_ID,
   PAYFAST_MERCHANT_KEY,
-  PAYFAST_PASSPHRASE, // Set this in PayFast: Settings → Integration → Passphrase
+  PAYFAST_PASSPHRASE,
   BASE_URL,
+  FRONTEND_URL,
+  NODE_ENV,
 } = process.env;
 
-// Switch to live when ready:
-// Sandbox: "https://sandbox.payfast.co.za/eng/process"
-// Live:    "https://www.payfast.co.za/eng/process"
-const PAYFAST_BASE = "https://www.payfast.co.za/eng/process";
+const transporter = nodemailer.createTransport({
+  service: "gmail",
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS,
+  },
+});
 
-// PayFast IP whitelist for ITN validation (keep up to date)
-// https://developers.payfast.co.za/docs#step_5_itn
-const VALID_PAYFAST_IPS = [
-  "197.97.145.144",
-  "197.97.145.145",
-  "197.97.145.146",
-  "197.97.145.147",
-  "41.74.179.194",
-  "41.74.179.195",
-  "41.74.179.196",
-  "41.74.179.197",
+process.on("uncaughtException", err => {
+  console.error("💥 Uncaught Exception:", err);
+});
+
+process.on("unhandledRejection", err => {
+  console.error("💥 Unhandled Rejection:", err);
+});
+
+async function sendEmail(to, subject, text) {
+  try {
+    await transporter.sendMail({
+      from: `"MK2 Fitness" <${process.env.EMAIL_USER}>`,
+      to,
+      subject,
+      text,
+    });
+    console.log("📧 Email sent to:", to);
+  } catch (err) {
+    console.error("Email error:", err.message);
+  }
+}
+
+const IS_LIVE      = NODE_ENV === "production";
+const PAYFAST_HOST = "https://www.payfast.co.za"; // LIVE only
+
+const PAYFAST_IPS = [
+  "197.97.145.144", "197.97.145.145", "197.97.145.146", "197.97.145.147",
+  "41.74.179.194",  "41.74.179.195",  "41.74.179.196",  "41.74.179.197",
 ];
 
-// ── Signature generation ──────────────────────────────────────────────────────
-// PayFast requires an MD5 signature of all params (in submission order)
-// appended with your passphrase. Keys must be in the ORDER they appear in
-// the form / URL — so always build the object in the right order.
+// ─── Signature ────────────────────────────────────────────────────────────────
 function generateSignature(data, passphrase = "") {
   const pfData = { ...data };
 
   if (passphrase && passphrase.trim() !== "") {
-    pfData.passphrase = passphrase;
+    pfData.passphrase = passphrase.trim();
   }
 
-  const pfOutput = Object.keys(pfData)
-    .sort() // ✅ VERY IMPORTANT
-    .map(
-      key =>
-        `${key}=${encodeURIComponent(String(pfData[key])).replace(/%20/g, "+")}`
+  const str = Object.keys(pfData)
+    .sort()
+    .map(k =>
+      `${k}=${encodeURIComponent(String(pfData[k])).replace(/%20/g, "+")}`
     )
     .join("&");
 
-  console.log("🔐 SIGNATURE STRING:\n", pfOutput);
+  console.log("🔐 SIGN STRING:\n", str);
 
-  return crypto.createHash("md5").update(pfOutput).digest("hex");
+  return crypto.createHash("md5").update(str).digest("hex");
 }
 
+// ─── Find user ────────────────────────────────────────────────────────────────
+async function findUserRef(userId, email) {
+  if (userId) {
+    const snap = await db.ref(`mk2_users/${userId}`).get();
+    if (snap.exists()) return { ref: db.ref(`mk2_users/${userId}`), key: userId };
+  }
+  if (email) {
+    const snap = await db.ref("mk2_users")
+      .orderByChild("email").equalTo(email).limitToFirst(1).get();
+    if (snap.exists()) {
+      const key = Object.keys(snap.val())[0];
+      return { ref: db.ref(`mk2_users/${key}`), key };
+    }
+  }
+  return null;
+}
 
-app.use(cors({
-  origin: "*", // for testing (later restrict to your domain)
-}));
-
-// ── /api/payfast-sign ─────────────────────────────────────────────────────────
-// Called by Membership.tsx to get a signed PayFast URL.
-// This keeps your passphrase server-side only.
-app.post("/api/payfast-sign", (req, res) => {
+// ─── POST /api/payfast-sign ───────────────────────────────────────────────────
+app.post("/api/payfast-sign", signLimiter, (req, res) => {
   try {
-    const params = req.body;
+    const {
+      email_address, name_first, name_last,
+      item_name, amount, recurring_amount,
+      frequency, custom_str1, custom_str2, custom_str3,
+    } = req.body;
 
-    const signableParams = {
-      merchant_id: process.env.PAYFAST_MERCHANT_ID,
-      merchant_key: process.env.PAYFAST_MERCHANT_KEY,
+    if (!item_name || !amount || !frequency || !email_address || !custom_str1) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
+    const parsedAmount = parseFloat(amount);
+    if (isNaN(parsedAmount) || parsedAmount <= 0) {
+      return res.status(400).json({ error: "Invalid amount" });
+    }
+    if (!["3", "6"].includes(String(frequency))) {
+      return res.status(400).json({ error: "Invalid frequency" });
+    }
 
-      // ✅ MUST match frontend EXACTLY
-      return_url: params.return_url,
-      cancel_url: params.cancel_url,
-      notify_url: params.notify_url,
+    const frontendBase = (FRONTEND_URL || "https://gym-pro-20ee6.web.app").replace(/\/$/, "");
 
-      email_address: params.email_address,
-      name_first: params.name_first,
-      name_last: params.name_last,
-      item_name: params.item_name,
-      amount: params.amount,
+const params = {
+  merchant_id: PAYFAST_MERCHANT_ID,
+  merchant_key: PAYFAST_MERCHANT_KEY,
 
-      subscription_type: "1",
-      billing_date: new Date().toISOString().split("T")[0],
-      recurring_amount: params.recurring_amount || params.amount,
-      frequency: params.frequency,
-      cycles: "0",
-    };
+  return_url: `${frontendBase}/membership`,
+  cancel_url: `${frontendBase}/membership`,
+  notify_url: `${BASE_URL}/api/payfast-itn`,
 
-    const signature = generateSignature(
-      signableParams,
-      process.env.PAYFAST_PASSPHRASE
-    );
+  email_address,
+  item_name,
+  amount: parsedAmount.toFixed(2),
 
-    const queryString = Object.keys(signableParams)
-      .sort() // ✅ MUST MATCH SIGNATURE ORDER
-      .map(
-        key =>
-          `${key}=${encodeURIComponent(signableParams[key])}`
-      )
-      .join("&");
+  subscription_type: "1",
+  billing_date: new Date().toISOString().split("T")[0],
+  recurring_amount: parseFloat(recurring_amount || amount).toFixed(2),
+  frequency: String(frequency),
+  cycles: "0",
 
-    const url = `https://www.payfast.co.za/eng/process?${queryString}&signature=${signature}`;
+  custom_str1,
 
-    res.json({ url });
+  ...(name_first && { name_first }),
+  ...(name_last && { name_last }),
+  ...(custom_str2 && { custom_str2 }),
+  ...(custom_str3 && { custom_str3 }),
+};
+
+console.log("FINAL PARAMS:", params);
+    const signature = generateSignature(params, PAYFAST_PASSPHRASE);
+const qs = Object.keys(params)
+  .sort()
+  .map(k =>
+    `${k}=${encodeURIComponent(String(params[k])).replace(/%20/g, "+")}`
+  )
+  .join("&");
+
+    console.log("✅ Signed URL generated for:", email_address, "→", item_name);
+    res.json({ url: `${PAYFAST_HOST}/eng/process?${qs}&signature=${signature}` });
+
   } catch (err) {
-    console.error("❌ SIGN ERROR:", err);
-    res.status(500).json({ error: "Failed to sign PayFast request" });
+    console.error("Sign error:", err);
+    res.status(500).json({ error: "Failed to sign request" });
   }
 });
 
-
-async function updateUserMembership(email, tier, extra = {}) {
-  try {
-    const usersRef = db.ref("mk2_users");
-
-    const snapshot = await usersRef.once("value");
-    const users = snapshot.val();
-
-    if (!users) {
-      console.error("No users found in DB");
-      return;
-    }
-
-    let foundUserId = null;
-
-    // 🔍 Find user by email
-    for (const uid in users) {
-      if (users[uid].email === email) {
-        foundUserId = uid;
-        break;
-      }
-    }
-
-    if (!foundUserId) {
-      console.error(`❌ No user found for email: ${email}`);
-      return;
-    }
-
-    // ✅ Update membership
-    await usersRef.child(foundUserId).update({
-      membership: tier,
-      membershipUpdatedAt: Date.now(),
-
-      subscription: {
-        tier,
-        status: tier === "basic" ? "cancelled" : "active",
-        updatedAt: Date.now(),
-        ...extra,
-      },
-    });
-
-    console.log(`✅ Updated ${email} → ${tier}`);
-  } catch (err) {
-    console.error("❌ DB update error:", err);
-  }
-}
-// ── /api/payfast-itn ──────────────────────────────────────────────────────────
-// PayFast calls this endpoint after every payment event (new subscription,
-// recurring payment, cancellation, failed payment, etc.)
-// PayFast requires a 200 response within 10 seconds — do heavy work async.
+// ─── POST /api/payfast-itn ────────────────────────────────────────────────────
 app.post("/api/payfast-itn", async (req, res) => {
-  // ✅ ALWAYS respond immediately
-  res.sendStatus(200);
+  res.sendStatus(200); // Always respond immediately
 
   const data = req.body;
-  console.log("📩 ITN received:", data);
+  console.log("📩 ITN received:", JSON.stringify(data));
 
   try {
-    // ── STEP 1: Validate IP ─────────────────────────────────────
-    const callerIp =
-      req.headers["x-forwarded-for"]?.split(",")[0].trim() ||
-      req.socket.remoteAddress;
-
-    if (!VALID_PAYFAST_IPS.includes(callerIp)) {
-      console.error("❌ Invalid PayFast IP:", callerIp);
+    // Security 1: IP whitelist
+    const callerIp = (
+      req.headers["x-forwarded-for"]?.split(",")[0] ||
+      req.socket.remoteAddress || ""
+    ).trim();
+    if (IS_LIVE && !PAYFAST_IPS.includes(callerIp)) {
+      console.error(`ITN blocked — bad IP: ${callerIp}`);
       return;
     }
 
-    // ── STEP 2: Validate signature ─────────────────────────────
+    // Security 2: Signature
     const received = { ...data };
-    const theirSignature = received.signature;
+    const theirSig = received.signature;
     delete received.signature;
-
-    const ourSignature = generateSignature(received, PAYFAST_PASSPHRASE);
-
-    if (ourSignature !== theirSignature) {
-      console.error("❌ Signature mismatch");
+    const ourSig = generateSignature(received, PAYFAST_PASSPHRASE);
+    if (ourSig !== theirSig) {
+      console.error(`ITN blocked — signature mismatch`);
       return;
     }
 
-    // ── STEP 3: Confirm with PayFast ───────────────────────────
-    const pfHost =
-      PAYFAST_BASE.includes("sandbox")
-        ? "https://sandbox.payfast.co.za"
-        : "https://www.payfast.co.za";
-
+    // Security 3: Confirm with PayFast
     const confirmBody = Object.entries(data)
       .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`)
       .join("&");
-
     const confirmRes = await axios.post(
-      `${pfHost}/eng/query/validate`,
+      `${PAYFAST_HOST}/eng/query/validate`,
       confirmBody,
-      {
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      }
+      { headers: { "Content-Type": "application/x-www-form-urlencoded" }, timeout: 8000 }
     );
-
-    if (confirmRes.data.trim() !== "VALID") {
-      console.error("❌ PayFast validation failed:", confirmRes.data);
+    if (confirmRes.data?.trim() !== "VALID") {
+      console.error("ITN blocked — PayFast validation failed:", confirmRes.data);
       return;
     }
 
-    // ── STEP 4: Extract info ───────────────────────────────────
-    const email = data.email_address;
-    const status = data.payment_status;
-    const itemName = (data.item_name || "").toLowerCase();
+    // Parse
+    const status  = data.payment_status;
+    const userId  = data.custom_str1;
+    const tierId  = data.custom_str2 || inferTier(data.item_name);
+    const billing = data.custom_str3 || "monthly";
+    const token   = data.token;
+    const email   = data.email_address;
 
-    let tier = "basic";
-    if (itemName.includes("gold")) tier = "gold";
-    else if (itemName.includes("silver")) tier = "silver";
+    const found = await findUserRef(userId, email);
+    if (!found) {
+      console.error(`ITN: user not found — userId=${userId}, email=${email}`);
+      return;
+    }
 
-    // ── STEP 5: Handle payment status ──────────────────────────
+    const { ref: userRef, key: userKey } = found;
+    const userSnap = await userRef.get();
+    const userData = userSnap.val() || {};
 
+    // ── COMPLETE ──────────────────────────────────────────────────────────────
     if (status === "COMPLETE") {
-      console.log(`✅ COMPLETE: ${email} → ${tier}`);
+      const isNewGold   = tierId === "gold"   && userData.membership !== "gold";
+      const isNewSilver = tierId === "silver" && userData.membership !== "silver";
 
-      await updateUserMembership(email, tier, {
-        payfastPaymentId: data.pf_payment_id,
-        subscriptionToken: data.token, // 🔥 VERY IMPORTANT
-        billingFrequency: data.frequency === "6" ? "yearly" : "monthly",
-        nextBillingDate: data.billing_date || null,
+      const update = {
+        membership:          tierId,
+        membershipBilling:   billing,         // "monthly" or "yearly"
+        membershipSince:     userData.membershipSince || Date.now(),
+        membershipUpdatedAt: Date.now(),
+        subscriptionToken:   token || null,   // needed for cancellation
+        lastPaymentId:       data.pf_payment_id,
+        lastPaymentAmount:   data.amount_gross,
+        cancelledAt:         null,
+        membershipFailedAt:  null,
+      };
+
+      // Gold: 10 free class credits on first activation
+      if (isNewGold) {
+        update.classCredits = (userData.classCredits || 0) + 10;
+        update.aiQuota = {
+          remaining: 200,
+          resetDate: nextMonthFirst(),
+        };
+      }
+
+      // Silver: AI quota on first activation
+      if (isNewSilver) {
+        update.aiQuota = {
+          remaining: 50,
+          resetDate: nextMonthFirst(),
+        };
+      }
+
+      await userRef.update(update);
+
+      // Log payment history
+      await db.ref(`paymentHistory/${userKey}`).push({
+        event:     "complete",
+        tier:      tierId,
+        billing,
+        amount:    data.amount_gross,
+        paymentId: data.pf_payment_id,
+        token:     token || null,
+        date:      Date.now(),
       });
 
+      console.log(`✅ COMPLETE: ${userId || email} → ${tierId} (${billing}) R${data.amount_gross}`);
+
+           await sendEmail(
+  email,
+  "✅ Payment Successful - MK2 Membership",
+  `Hi,
+
+Your payment was successful 🎉
+
+Plan: ${tierId.toUpperCase()}
+Billing: ${billing}
+Amount: R${data.amount_gross}
+
+Welcome to MK2 Fitness!
+
+- MK2 Team`
+);
+
+
+    // ── CANCELLED ─────────────────────────────────────────────────────────────
     } else if (status === "CANCELLED") {
-      console.log(`⚠️ CANCELLED: ${email}`);
-
-      await updateUserMembership(email, "basic", {
-        cancelledAt: Date.now(),
+      await userRef.update({
+        membership:          "basic",
+        membershipBilling:   null,
+        subscriptionToken:   null,
+        membershipUpdatedAt: Date.now(),
+        cancelledAt:         Date.now(),
+        aiQuota:             null,
       });
+      await db.ref(`paymentHistory/${userKey}`).push({
+        event: "cancelled",
+        date:  Date.now(),
+      });
+      console.log(`⚠️ CANCELLED: ${userId || email} → basic`);
 
+      await sendEmail(
+  email,
+  "❌ Subscription Cancelled - MK2 Membership",
+  `Hi,
+
+Your subscription has been cancelled.
+
+You are now on the Basic plan.
+
+We're sorry to see you go — you're always welcome back!
+
+- MK2 Team`
+);
+
+    // ── FAILED (card declined etc) ────────────────────────────────────────────
     } else if (status === "FAILED") {
-      console.log(`❌ FAILED: ${email}`);
+      // Log the failure — PayFast will retry automatically
+      // If too many failures, PayFast sends CANCELLED
+      await userRef.update({ membershipFailedAt: Date.now() });
+      await db.ref(`paymentHistory/${userKey}`).push({
+        event:     "failed",
+        paymentId: data.pf_payment_id || null,
+        date:      Date.now(),
+      });
+      console.log(`❌ FAILED: ${userId || email} — PayFast will retry`);
 
-    } else if (status === "PENDING") {
-      console.log(`⏳ PENDING: ${email}`);
+      await sendEmail(
+  email,
+  "⚠️ Payment Failed - MK2 Membership",
+  `Hi,
+
+Your recent payment attempt failed.
+
+PayFast will retry automatically, but please ensure:
+- Your card has sufficient funds
+- Your payment method is valid
+
+If the issue continues, your subscription may be cancelled.
+
+- MK2 Team`
+);
 
     } else {
-      console.log(`ℹ️ UNKNOWN STATUS: ${status}`);
+      console.log(`ℹ️ ITN status: ${status}`);
     }
 
   } catch (err) {
-    console.error("❌ ITN processing error:", err.message);
+    console.error("ITN error:", err);
   }
 });
 
-// ── Update user membership in Firestore ───────────────────────────────────────
-// Adjust the collection/document path to match your Firestore structure.
-async function updateUserMembership(email, tier, extra = {}) {
-  // Find user doc by email field
-  const snapshot = await db
-    .collection("users")
-    .where("email", "==", email)
-    .limit(1)
-    .get();
+// ─── POST /api/cancel-subscription ───────────────────────────────────────────
+app.post("/api/cancel-subscription", cancelLimiter, async (req, res) => {
+  const { userId } = req.body;
+  if (!userId) return res.status(400).json({ error: "userId required" });
 
-  if (snapshot.empty) {
-    console.error(`No user found for email: ${email}`);
-    return;
+  try {
+    const snap = await db.ref(`mk2_users/${userId}`).get();
+    if (!snap.exists()) return res.status(404).json({ error: "User not found" });
+
+    const userData = snap.val();
+
+    if (!userData.subscriptionToken) {
+      // No token — just downgrade locally
+      await db.ref(`mk2_users/${userId}`).update({
+        membership:          "basic",
+        membershipBilling:   null,
+        subscriptionToken:   null,
+        membershipUpdatedAt: Date.now(),
+        cancelledAt:         Date.now(),
+        aiQuota:             null,
+      });
+      await db.ref(`paymentHistory/${userId}`).push({
+        event: "cancelled_via_app",
+        date:  Date.now(),
+      });
+await sendEmail(
+  userData.email,
+  "❌ Subscription Cancelled",
+  `Hi,
+
+Your subscription has been successfully cancelled via the app.
+
+You are now on the Basic plan.
+
+- MK2 Team`
+);
+
+      return res.json({ success: true });
+    }
+
+    if (userData.membership === "basic") {
+      return res.status(400).json({ error: "Already on basic plan" });
+    }
+
+    // Call PayFast API to cancel subscription
+    const timestamp = new Date().toISOString();
+    const version   = "v1";
+    const apiParams = {
+      "merchant-id": PAYFAST_MERCHANT_ID,
+      passphrase:    PAYFAST_PASSPHRASE,
+      timestamp,
+      version,
+    };
+    const apiSigStr = Object.keys(apiParams)
+      .sort()
+      .map(k => `${k}=${encodeURIComponent(String(apiParams[k]))}`)
+      .join("&");
+    const apiSig = crypto.createHash("md5").update(apiSigStr).digest("hex");
+
+    try {
+      await axios.put(
+        `${PAYFAST_HOST}/api/subscriptions/${userData.subscriptionToken}/cancel`,
+        {},
+        {
+          headers: {
+            "merchant-id":  PAYFAST_MERCHANT_ID,
+            "version":      version,
+            "timestamp":    timestamp,
+            "signature":    apiSig,
+            "Content-Type": "application/json",
+          },
+          timeout: 8000,
+        }
+      );
+    } catch (pfErr) {
+      console.error("PayFast cancel API error:", pfErr.response?.data || pfErr.message);
+      // Continue anyway — still downgrade locally
+    }
+
+    // Downgrade in DB regardless
+    await db.ref(`mk2_users/${userId}`).update({
+      membership:          "basic",
+      membershipBilling:   null,
+      subscriptionToken:   null,
+      membershipUpdatedAt: Date.now(),
+      cancelledAt:         Date.now(),
+      aiQuota:             null,
+    });
+    await db.ref(`paymentHistory/${userId}`).push({
+      event: "cancelled_via_app",
+      date:  Date.now(),
+    });
+
+    res.json({ success: true });
+
+  } catch (err) {
+    console.error("Cancel error:", err.message);
+    res.status(500).json({ error: "Cancellation failed" });
   }
+});
 
-  const userDoc = snapshot.docs[0];
-  await userDoc.ref.update({
-    membership: tier,
-    membershipUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    ...extra,
-  });
-
-  console.log(`✅ Updated ${email} → membership: ${tier}`);
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+function inferTier(itemName = "") {
+  const n = itemName.toLowerCase();
+  if (n.includes("gold"))   return "gold";
+  if (n.includes("silver")) return "silver";
+  return "basic";
 }
 
-// ── /api/payfast-cancel ───────────────────────────────────────────────────────
-// Optional: If you want to cancel a subscription programmatically (e.g.
-// from an admin panel) rather than through the PayFast portal.
-// Requires the subscription token saved from the ITN COMPLETE event.
-app.post("/api/payfast-cancel", async (req, res) => {
-  const { subscriptionToken } = req.body;
-  if (!subscriptionToken) {
-    return res.status(400).json({ error: "subscriptionToken required" });
-  }
-  try {
-    const pfHost =
-      PAYFAST_BASE.includes("sandbox")
-        ? "https://sandbox.payfast.co.za"
-        : "https://www.payfast.co.za";
+function nextMonthFirst() {
+  const d = new Date();
+  d.setMonth(d.getMonth() + 1);
+  d.setDate(1);
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
+}
 
-    // PayFast cancel endpoint requires a signed request
-    // https://developers.payfast.co.za/docs#cancel-subscription
-    const timestamp = new Date().toISOString();
-    const headers = {
-      "merchant-id": PAYFAST_MERCHANT_ID,
-      version: "v1",
-      timestamp,
-      // For full API key-signed requests, PayFast uses HMAC-SHA256 — see their API docs
-    };
+// ─── Health check ─────────────────────────────────────────────────────────────
+app.get("/health", (_, res) => res.json({
+  ok:   true,
+  mode: IS_LIVE ? "live" : "dev",
+  base: BASE_URL,
+}));
 
-    const cancelRes = await axios.put(
-      `${pfHost}/api/subscriptions/${subscriptionToken}/cancel`,
-      {},
-      { headers },
-    );
 
-    if (cancelRes.data.data?.response === 200) {
-      res.json({ success: true });
-    } else {
-      res.status(400).json({ error: "Cancel failed", data: cancelRes.data });
-    }
-  } catch (err) {
-    console.error("Cancel error:", err.response?.data || err.message);
-    res.status(500).json({ error: "Cancel request failed" });
-  }
+// ─── Start ────────────────────────────────────────────────────────────────────
+const PORT = process.env.PORT || 5000;
+console.log("PORT FROM ENV:", process.env.PORT);
+
+app.get("/", (_, res) => {
+  res.send("Server is running 🚀");
 });
-
-// ── Success / Cancel redirect pages ──────────────────────────────────────────
-// These are redirect targets after PayFast payment completes or is cancelled.
-// In your SPA setup you likely handle this in React — these are fallbacks.
-app.get("/membership", (req, res) => {
-  // Redirect back to your React app's membership page
-  res.redirect("https://gym-pro-20ee6.web.app/membership");
-});
-
-// ── Start server ──────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`🔔 ITN endpoint: ${BASE_URL}/api/payfast-itn`);
-  console.log(`🔑 Signing endpoint: ${BASE_URL}/api/payfast-sign`);
+  console.log(`\n🚀 Server on port ${PORT} [${IS_LIVE ? "LIVE" : "dev"}]`);
+  console.log(`🔔 ITN:    ${BASE_URL}/api/payfast-itn`);
+  console.log(`🔑 Sign:   ${BASE_URL}/api/payfast-sign`);
+  console.log(`❌ Cancel: ${BASE_URL}/api/cancel-subscription\n`);
 });
