@@ -131,8 +131,7 @@ async function findUserRef(userId, email) {
 }
 
 // ─── POST /api/payfast-sign ───────────────────────────────────────────────────
-app.post("/api/payfast-sign", signLimiter, (req, res) => {
-  try {
+app.post("/api/payfast-sign", signLimiter, async (req, res) => {  try {
     const {
       email_address, name_first, name_last,
       item_name, amount, recurring_amount,
@@ -143,6 +142,38 @@ app.post("/api/payfast-sign", signLimiter, (req, res) => {
       return res.status(400).json({ error: "Missing required fields" });
     }
     const parsedAmount = parseFloat(amount);
+    let finalAmount = parsedAmount;
+
+if (custom_str1 && db) {
+  const userSnap = await db.ref(`mk2_users/${custom_str1}`).get();
+
+  if (userSnap.exists()) {
+    const user = userSnap.val();
+
+    // only apply if upgrading
+    if (user.membership && user.membership !== "basic" && user.membership !== custom_str2) {
+
+      const now = Date.now();
+      const start = user.membershipSince || now;
+
+      const totalDays = (custom_str3 === "yearly") ? 365 : 30;
+
+      const currentPrice =
+        user.membership === "silver"
+          ? (custom_str3 === "yearly" ? 228 : 24)
+          : (custom_str3 === "yearly" ? 588 : 54);
+
+      const usedDays = Math.floor((now - start) / (1000 * 60 * 60 * 24));
+      const remainingDays = Math.max(totalDays - usedDays, 0);
+
+      const credit = (remainingDays / totalDays) * currentPrice;
+
+      finalAmount = Math.max(parsedAmount - credit, 5);
+
+      console.log(`💰 Credit: R${credit.toFixed(2)} → Final: R${finalAmount.toFixed(2)}`);
+    }
+  }
+}
     if (isNaN(parsedAmount) || parsedAmount <= 0) {
       return res.status(400).json({ error: "Invalid amount" });
     }
@@ -162,7 +193,7 @@ const params = {
 
   email_address,
   item_name,
-  amount: parsedAmount.toFixed(2),
+amount: finalAmount.toFixed(2),
 
   subscription_type: "1",
   billing_date: new Date().toISOString().split("T")[0],
@@ -263,6 +294,45 @@ app.post("/api/payfast-itn", async (req, res) => {
 
     // ── COMPLETE ──────────────────────────────────────────────────────────────
     if (status === "COMPLETE") {
+      // 🔥 AUTO CANCEL OLD SUB IF UPGRADING
+if (userData.subscriptionToken && userData.membership !== tierId) {
+  console.log("🔄 Cancelling old subscription...");
+
+  const timestamp = new Date().toISOString();
+  const version = "v1";
+
+  const sigParams = {
+    "merchant-id": PAYFAST_MERCHANT_ID,
+    passphrase: PAYFAST_PASSPHRASE,
+    timestamp,
+    version,
+  };
+
+  const sigStr = Object.keys(sigParams)
+    .sort()
+    .map(k => `${k}=${encodeURIComponent(sigParams[k])}`)
+    .join("&");
+
+  const signature = crypto.createHash("md5").update(sigStr).digest("hex");
+
+  try {
+    await axios.put(
+      `${PAYFAST_HOST}/api/subscriptions/${userData.subscriptionToken}/cancel`,
+      {},
+      {
+        headers: {
+          "merchant-id": PAYFAST_MERCHANT_ID,
+          version,
+          timestamp,
+          signature,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+  } catch (err) {
+    console.error("Auto cancel failed:", err.message);
+  }
+}
       const isNewGold   = tierId === "gold"   && userData.membership !== "gold";
       const isNewSilver = tierId === "silver" && userData.membership !== "silver";
 
