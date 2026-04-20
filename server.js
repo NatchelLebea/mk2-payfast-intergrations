@@ -232,6 +232,20 @@ app.post("/api/payfast-itn", async (req, res) => {
   res.sendStatus(200); // Always respond immediately
 
   const data = req.body;
+
+  const paymentId = data.pf_payment_id;
+
+if (paymentId) {
+  const existing = await db.ref(`processedPayments/${paymentId}`).get();
+
+  if (existing.exists()) {
+    console.log("⚠️ Duplicate ITN ignored:", paymentId);
+    return;
+  }
+
+  await db.ref(`processedPayments/${paymentId}`).set(true);
+}
+
   console.log("📩 ITN received:", JSON.stringify(data));
 
   if (!firebaseReady || !db) {
@@ -339,7 +353,7 @@ if (userData.subscriptionToken && userData.membership !== tierId) {
       const update = {
         membership:          tierId,
         membershipBilling:   billing,         // "monthly" or "yearly"
-        membershipSince:     userData.membershipSince || Date.now(),
+        membershipSince: Date.now(),
         membershipUpdatedAt: Date.now(),
         subscriptionToken:   token || null,   // needed for cancellation
         lastPaymentId:       data.pf_payment_id,
@@ -466,6 +480,19 @@ If the issue continues, your subscription may be cancelled.
 
 // ─── POST /api/cancel-subscription ───────────────────────────────────────────
 app.post("/api/cancel-subscription", cancelLimiter, async (req, res) => {
+  const authHeader = req.headers.authorization;
+
+if (!authHeader) {
+  return res.status(401).json({ error: "Unauthorized" });
+}
+
+const token = authHeader.split("Bearer ")[1];
+
+const decoded = await admin.auth().verifyIdToken(token);
+
+if (decoded.uid !== req.body.userId) {
+  return res.status(403).json({ error: "Forbidden" });
+}
   const { userId } = req.body;
   if (!userId) return res.status(400).json({ error: "userId required" });
   if (!requireFirebase(res)) return;
