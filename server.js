@@ -15,6 +15,8 @@ let firebaseReady = false;
 // ─── App ──────────────────────────────────────────────────────────────────────
 const app = express();
 app.use(helmet());
+app.set("trust proxy", 1);
+
 
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
   .split(",").map(o => o.trim()).filter(Boolean);
@@ -192,8 +194,11 @@ app.post("/api/payfast-sign", signLimiter, async (req, res) => {
 
       if (userSnap.exists()) {
         const user = userSnap.val();
-        const isUpgrade = user.membership && user.membership !== "basic" && user.membership !== custom_str2;
-
+const tierOrder = { basic: 0, silver: 1, gold: 2 };
+    const currentRank = tierOrder[user.membership] ?? 0;
+    const newRank = tierOrder[custom_str2] ?? 0;
+    const isUpgrade = user.membership && user.membership !== "basic" && newRank > currentRank;
+    
         if (isUpgrade) {
           // 1. Calculate pro-rata credit
           const now          = Date.now();
