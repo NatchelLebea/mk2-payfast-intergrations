@@ -104,6 +104,38 @@ function generateSignature(data, passphrase = "") {
   return crypto.createHash("md5").update(str).digest("hex");
 }
 
+// ─── PayFast subscription cancel helper ──────────────────────────────────────
+async function cancelPayFastSubscription(token) {
+  const timestamp = new Date().toISOString();
+  const version   = "v1";
+  const sigParams = {
+    "merchant-id": PAYFAST_MERCHANT_ID,
+    passphrase:    PAYFAST_PASSPHRASE,
+    timestamp,
+    version,
+  };
+  const sigStr = Object.keys(sigParams)
+    .sort()
+    .map(k => `${k}=${encodeURIComponent(sigParams[k])}`)
+    .join("&");
+  const signature = crypto.createHash("md5").update(sigStr).digest("hex");
+
+  await axios.put(
+    `${PAYFAST_HOST}/api/subscriptions/${token}/cancel`,
+    {},
+    {
+      headers: {
+        "merchant-id":  PAYFAST_MERCHANT_ID,
+        version,
+        timestamp,
+        signature,
+        "Content-Type": "application/json",
+      },
+      timeout: 8000,
+    }
+  );
+}
+
 // ─── Firebase readiness guard ─────────────────────────────────────────────────
 function requireFirebase(res) {
   if (!firebaseReady || !db) {
@@ -131,7 +163,8 @@ async function findUserRef(userId, email) {
 }
 
 // ─── POST /api/payfast-sign ───────────────────────────────────────────────────
-app.post("/api/payfast-sign", signLimiter, async (req, res) => {  try {
+app.post("/api/payfast-sign", signLimiter, async (req, res) => {
+  try {
     const {
       email_address, name_first, name_last,
       item_name, amount, recurring_amount,
@@ -141,39 +174,9 @@ app.post("/api/payfast-sign", signLimiter, async (req, res) => {  try {
     if (!item_name || !amount || !frequency || !email_address || !custom_str1) {
       return res.status(400).json({ error: "Missing required fields" });
     }
+
     const parsedAmount = parseFloat(amount);
-    let finalAmount = parsedAmount;
 
-if (custom_str1 && db) {
-  const userSnap = await db.ref(`mk2_users/${custom_str1}`).get();
-
-  if (userSnap.exists()) {
-    const user = userSnap.val();
-
-    // only apply if upgrading
-    if (user.membership && user.membership !== "basic" && user.membership !== custom_str2) {
-
-      const now = Date.now();
-      const start = user.membershipSince || now;
-
-      const totalDays = (custom_str3 === "yearly") ? 365 : 30;
-
-      const currentPrice =
-        user.membership === "silver"
-          ? (custom_str3 === "yearly" ? 228 : 24)
-          : (custom_str3 === "yearly" ? 588 : 54);
-
-      const usedDays = Math.floor((now - start) / (1000 * 60 * 60 * 24));
-      const remainingDays = Math.max(totalDays - usedDays, 0);
-
-      const credit = (remainingDays / totalDays) * currentPrice;
-
-      finalAmount = Math.max(parsedAmount - credit, 5);
-
-      console.log(`💰 Credit: R${credit.toFixed(2)} → Final: R${finalAmount.toFixed(2)}`);
-    }
-  }
-}
     if (isNaN(parsedAmount) || parsedAmount <= 0) {
       return res.status(400).json({ error: "Invalid amount" });
     }
@@ -181,42 +184,76 @@ if (custom_str1 && db) {
       return res.status(400).json({ error: "Invalid frequency" });
     }
 
+    let finalAmount = parsedAmount;
+
+    // ── Pro-rata credit + cancel old sub if upgrading ─────────────────────────
+    if (db && custom_str1) {
+      const userSnap = await db.ref(`mk2_users/${custom_str1}`).get();
+
+      if (userSnap.exists()) {
+        const user = userSnap.val();
+        const isUpgrade = user.membership && user.membership !== "basic" && user.membership !== custom_str2;
+
+        if (isUpgrade) {
+          // 1. Calculate pro-rata credit
+          const now          = Date.now();
+          const start        = user.membershipSince || now;
+          const totalDays    = (custom_str3 === "yearly") ? 365 : 30;
+          const currentPrice =
+            user.membership === "silver"
+              ? (custom_str3 === "yearly" ? 228 : 24)
+              : (custom_str3 === "yearly" ? 588 : 54);
+
+          const usedDays      = Math.floor((now - start) / (1000 * 60 * 60 * 24));
+          const remainingDays = Math.max(totalDays - usedDays, 0);
+          const credit        = (remainingDays / totalDays) * currentPrice;
+
+          finalAmount = Math.max(parsedAmount - credit, 5);
+          console.log(`💰 Credit: R${credit.toFixed(2)} → Final: R${finalAmount.toFixed(2)}`);
+
+          // 2. Cancel old subscription NOW before creating the new one
+          if (user.subscriptionToken) {
+            try {
+              await cancelPayFastSubscription(user.subscriptionToken);
+              console.log("✅ Old subscription cancelled before upgrade");
+            } catch (err) {
+              console.error("⚠️ Could not cancel old sub (continuing anyway):", err.message);
+            }
+          }
+        }
+      }
+    }
+
     const frontendBase = (FRONTEND_URL || "https://gym-pro-20ee6.web.app").replace(/\/$/, "");
 
-const params = {
-  merchant_id: PAYFAST_MERCHANT_ID,
-  merchant_key: PAYFAST_MERCHANT_KEY,
+    const params = {
+      merchant_id:       PAYFAST_MERCHANT_ID,
+      merchant_key:      PAYFAST_MERCHANT_KEY,
+      return_url:        `${frontendBase}/membership`,
+      cancel_url:        `${frontendBase}/membership`,
+      notify_url:        `${BASE_URL}/api/payfast-itn`,
+      email_address,
+      item_name,
+      amount:            finalAmount.toFixed(2),
+      subscription_type: "1",
+      billing_date:      new Date().toISOString().split("T")[0],
+      recurring_amount:  parseFloat(recurring_amount || amount).toFixed(2),
+      frequency:         String(frequency),
+      cycles:            "0",
+      custom_str1,
+      ...(name_first  && { name_first }),
+      ...(name_last   && { name_last }),
+      ...(custom_str2 && { custom_str2 }),
+      ...(custom_str3 && { custom_str3 }),
+    };
 
-  return_url: `${frontendBase}/membership`,
-  cancel_url: `${frontendBase}/membership`,
-  notify_url: `${BASE_URL}/api/payfast-itn`,
+    console.log("FINAL PARAMS:", params);
 
-  email_address,
-  item_name,
-amount: finalAmount.toFixed(2),
-
-  subscription_type: "1",
-  billing_date: new Date().toISOString().split("T")[0],
-  recurring_amount: parseFloat(recurring_amount || amount).toFixed(2),
-  frequency: String(frequency),
-  cycles: "0",
-
-  custom_str1,
-
-  ...(name_first && { name_first }),
-  ...(name_last && { name_last }),
-  ...(custom_str2 && { custom_str2 }),
-  ...(custom_str3 && { custom_str3 }),
-};
-
-console.log("FINAL PARAMS:", params);
     const signature = generateSignature(params, PAYFAST_PASSPHRASE);
-const qs = Object.keys(params)
-  .sort()
-  .map(k =>
-    `${k}=${encodeURIComponent(String(params[k])).replace(/%20/g, "+")}`
-  )
-  .join("&");
+    const qs = Object.keys(params)
+      .sort()
+      .map(k => `${k}=${encodeURIComponent(String(params[k])).replace(/%20/g, "+")}`)
+      .join("&");
 
     console.log("✅ Signed URL generated for:", email_address, "→", item_name);
     res.json({ url: `${PAYFAST_HOST}/eng/process?${qs}&signature=${signature}` });
@@ -233,18 +270,16 @@ app.post("/api/payfast-itn", async (req, res) => {
 
   const data = req.body;
 
+  // Deduplicate
   const paymentId = data.pf_payment_id;
-
-if (paymentId) {
-  const existing = await db.ref(`processedPayments/${paymentId}`).get();
-
-  if (existing.exists()) {
-    console.log("⚠️ Duplicate ITN ignored:", paymentId);
-    return;
+  if (paymentId) {
+    const existing = await db.ref(`processedPayments/${paymentId}`).get();
+    if (existing.exists()) {
+      console.log("⚠️ Duplicate ITN ignored:", paymentId);
+      return;
+    }
+    await db.ref(`processedPayments/${paymentId}`).set(true);
   }
-
-  await db.ref(`processedPayments/${paymentId}`).set(true);
-}
 
   console.log("📩 ITN received:", JSON.stringify(data));
 
@@ -265,10 +300,10 @@ if (paymentId) {
     }
 
     // Security 2: Signature
-    const received = { ...data };
-    const theirSig = received.signature;
+    const received  = { ...data };
+    const theirSig  = received.signature;
     delete received.signature;
-    const ourSig = generateSignature(received, PAYFAST_PASSPHRASE);
+    const ourSig    = generateSignature(received, PAYFAST_PASSPHRASE);
     if (ourSig !== theirSig) {
       console.error(`ITN blocked — signature mismatch`);
       return;
@@ -304,62 +339,25 @@ if (paymentId) {
 
     const { ref: userRef, key: userKey } = found;
     const userSnap = await userRef.get();
-    const userData = userSnap.val() || {};
+    const userData  = userSnap.val() || {};
 
     // ── COMPLETE ──────────────────────────────────────────────────────────────
     if (status === "COMPLETE") {
-      // 🔥 AUTO CANCEL OLD SUB IF UPGRADING
-if (userData.subscriptionToken && userData.membership !== tierId) {
-  console.log("🔄 Cancelling old subscription...");
-
-  const timestamp = new Date().toISOString();
-  const version = "v1";
-
-  const sigParams = {
-    "merchant-id": PAYFAST_MERCHANT_ID,
-    passphrase: PAYFAST_PASSPHRASE,
-    timestamp,
-    version,
-  };
-
-  const sigStr = Object.keys(sigParams)
-    .sort()
-    .map(k => `${k}=${encodeURIComponent(sigParams[k])}`)
-    .join("&");
-
-  const signature = crypto.createHash("md5").update(sigStr).digest("hex");
-
-  try {
-    await axios.put(
-      `${PAYFAST_HOST}/api/subscriptions/${userData.subscriptionToken}/cancel`,
-      {},
-      {
-        headers: {
-          "merchant-id": PAYFAST_MERCHANT_ID,
-          version,
-          timestamp,
-          signature,
-          "Content-Type": "application/json",
-        },
-      }
-    );
-  } catch (err) {
-    console.error("Auto cancel failed:", err.message);
-  }
-}
       const isNewGold   = tierId === "gold"   && userData.membership !== "gold";
       const isNewSilver = tierId === "silver" && userData.membership !== "silver";
 
       const update = {
-        membership:          tierId,
-        membershipBilling:   billing,         // "monthly" or "yearly"
-        membershipSince: Date.now(),
-        membershipUpdatedAt: Date.now(),
-        subscriptionToken:   token || null,   // needed for cancellation
-        lastPaymentId:       data.pf_payment_id,
-        lastPaymentAmount:   data.amount_gross,
-        cancelledAt:         null,
-        membershipFailedAt:  null,
+        membership:               tierId,
+        membershipBilling:        billing,
+        membershipSince:          Date.now(),
+        membershipUpdatedAt:      Date.now(),
+        subscriptionToken:        token || null,
+        lastPaymentId:            data.pf_payment_id,
+        lastPaymentAmount:        data.amount_gross,
+        cancelledAt:              null,
+        membershipFailedAt:       null,
+        cancellationPending:      false,
+        cancellationRequestedAt:  null,
       };
 
       // Gold: 10 free class credits on first activation
@@ -381,7 +379,6 @@ if (userData.subscriptionToken && userData.membership !== tierId) {
 
       await userRef.update(update);
 
-      // Log payment history
       await db.ref(`paymentHistory/${userKey}`).push({
         event:     "complete",
         tier:      tierId,
@@ -394,80 +391,57 @@ if (userData.subscriptionToken && userData.membership !== tierId) {
 
       console.log(`✅ COMPLETE: ${userId || email} → ${tierId} (${billing}) R${data.amount_gross}`);
 
-           await sendEmail(
-  email,
-  "✅ Payment Successful - MK2 Membership",
-  `Hi,
+      await sendEmail(
+        email,
+        "✅ Payment Successful - MK2 Membership",
+        `Hi,\n\nYour payment was successful 🎉\n\nPlan: ${tierId.toUpperCase()}\nBilling: ${billing}\nAmount: R${data.amount_gross}\n\nWelcome to MK2 Fitness!\n\n- MK2 Team`
+      );
 
-Your payment was successful 🎉
-
-Plan: ${tierId.toUpperCase()}
-Billing: ${billing}
-Amount: R${data.amount_gross}
-
-Welcome to MK2 Fitness!
-
-- MK2 Team`
-);
-
-
-    // ── CANCELLED ─────────────────────────────────────────────────────────────
+    // ── CANCELLED — fires at end of billing period ────────────────────────────
     } else if (status === "CANCELLED") {
       await userRef.update({
-        membership:          "basic",
-        membershipBilling:   null,
-        subscriptionToken:   null,
-        membershipUpdatedAt: Date.now(),
-        cancelledAt:         Date.now(),
-        aiQuota:             null,
+        membership:               "basic",
+        membershipBilling:        null,
+        subscriptionToken:        null,
+        membershipUpdatedAt:      Date.now(),
+        cancelledAt:              Date.now(),
+        aiQuota:                  null,
+        cancellationPending:      false,
+        cancellationRequestedAt:  null,
       });
+
       await db.ref(`paymentHistory/${userKey}`).push({
         event: "cancelled",
         date:  Date.now(),
       });
+
       console.log(`⚠️ CANCELLED: ${userId || email} → basic`);
 
       await sendEmail(
-  email,
-  "❌ Subscription Cancelled - MK2 Membership",
-  `Hi,
-
-Your subscription has been cancelled.
-
-You are now on the Basic plan.
-
-We're sorry to see you go — you're always welcome back!
-
-- MK2 Team`
-);
+        email,
+        "❌ Subscription Cancelled - MK2 Membership",
+        `Hi,\n\nYour subscription has now ended and you have been moved to the Basic plan.\n\nWe're sorry to see you go — you're always welcome back!\n\n- MK2 Team`
+      );
 
     // ── FAILED (card declined etc) ────────────────────────────────────────────
     } else if (status === "FAILED") {
-      // Log the failure — PayFast will retry automatically
-      // If too many failures, PayFast sends CANCELLED
+      // Do NOT downgrade — PayFast retries automatically.
+      // Only downgrades when PayFast gives up and sends CANCELLED.
       await userRef.update({ membershipFailedAt: Date.now() });
+
       await db.ref(`paymentHistory/${userKey}`).push({
         event:     "failed",
         paymentId: data.pf_payment_id || null,
         date:      Date.now(),
       });
+
       console.log(`❌ FAILED: ${userId || email} — PayFast will retry`);
 
       await sendEmail(
-  email,
-  "⚠️ Payment Failed - MK2 Membership",
-  `Hi,
-
-Your recent payment attempt failed.
-
-PayFast will retry automatically, but please ensure:
-- Your card has sufficient funds
-- Your payment method is valid
-
-If the issue continues, your subscription may be cancelled.
-
-- MK2 Team`
-);
+        email,
+        "⚠️ Payment Failed - MK2 Membership",
+        `Hi,\n\nYour recent payment attempt failed.\n\nPayFast will retry automatically, but please ensure:\n- Your card has sufficient funds\n- Your payment method is valid\n\nIf the issue continues, your subscription may be cancelled.\n\n- MK2 Team`
+      );
 
     } else {
       console.log(`ℹ️ ITN status: ${status}`);
@@ -482,17 +456,17 @@ If the issue continues, your subscription may be cancelled.
 app.post("/api/cancel-subscription", cancelLimiter, async (req, res) => {
   const authHeader = req.headers.authorization;
 
-if (!authHeader) {
-  return res.status(401).json({ error: "Unauthorized" });
-}
+  if (!authHeader) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
 
-const token = authHeader.split("Bearer ")[1];
+  const token   = authHeader.split("Bearer ")[1];
+  const decoded = await admin.auth().verifyIdToken(token);
 
-const decoded = await admin.auth().verifyIdToken(token);
+  if (decoded.uid !== req.body.userId) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
 
-if (decoded.uid !== req.body.userId) {
-  return res.status(403).json({ error: "Forbidden" });
-}
   const { userId } = req.body;
   if (!userId) return res.status(400).json({ error: "userId required" });
   if (!requireFirebase(res)) return;
@@ -503,87 +477,43 @@ if (decoded.uid !== req.body.userId) {
 
     const userData = snap.val();
 
-    if (!userData.subscriptionToken) {
-      // No token — just downgrade locally
-      await db.ref(`mk2_users/${userId}`).update({
-        membership:          "basic",
-        membershipBilling:   null,
-        subscriptionToken:   null,
-        membershipUpdatedAt: Date.now(),
-        cancelledAt:         Date.now(),
-        aiQuota:             null,
-      });
-      await db.ref(`paymentHistory/${userId}`).push({
-        event: "cancelled_via_app",
-        date:  Date.now(),
-      });
-await sendEmail(
-  userData.email,
-  "❌ Subscription Cancelled",
-  `Hi,
-
-Your subscription has been successfully cancelled via the app.
-
-You are now on the Basic plan.
-
-- MK2 Team`
-);
-
-      return res.json({ success: true });
-    }
-
     if (userData.membership === "basic") {
       return res.status(400).json({ error: "Already on basic plan" });
     }
 
-    // Call PayFast API to cancel subscription
-    const timestamp = new Date().toISOString();
-    const version   = "v1";
-    const apiParams = {
-      "merchant-id": PAYFAST_MERCHANT_ID,
-      passphrase:    PAYFAST_PASSPHRASE,
-      timestamp,
-      version,
-    };
-    const apiSigStr = Object.keys(apiParams)
-      .sort()
-      .map(k => `${k}=${encodeURIComponent(String(apiParams[k]))}`)
-      .join("&");
-    const apiSig = crypto.createHash("md5").update(apiSigStr).digest("hex");
-
-    try {
-      await axios.put(
-        `${PAYFAST_HOST}/api/subscriptions/${userData.subscriptionToken}/cancel`,
-        {},
-        {
-          headers: {
-            "merchant-id":  PAYFAST_MERCHANT_ID,
-            "version":      version,
-            "timestamp":    timestamp,
-            "signature":    apiSig,
-            "Content-Type": "application/json",
-          },
-          timeout: 8000,
-        }
-      );
-    } catch (pfErr) {
-      console.error("PayFast cancel API error:", pfErr.response?.data || pfErr.message);
-      // Continue anyway — still downgrade locally
+    if (userData.cancellationPending) {
+      return res.status(400).json({ error: "Cancellation already requested" });
     }
 
-    // Downgrade in DB regardless
+    // Tell PayFast to stop future renewals
+    if (userData.subscriptionToken) {
+      try {
+        await cancelPayFastSubscription(userData.subscriptionToken);
+        console.log("✅ PayFast subscription cancelled for:", userId);
+      } catch (pfErr) {
+        console.error("PayFast cancel API error:", pfErr.response?.data || pfErr.message);
+        // Continue anyway — we still mark pending locally
+      }
+    }
+
+    // Mark as pending — DO NOT downgrade yet.
+    // The actual downgrade to basic happens when PayFast sends the CANCELLED ITN
+    // at the end of the current billing period.
     await db.ref(`mk2_users/${userId}`).update({
-      membership:          "basic",
-      membershipBilling:   null,
-      subscriptionToken:   null,
-      membershipUpdatedAt: Date.now(),
-      cancelledAt:         Date.now(),
-      aiQuota:             null,
+      cancellationPending:     true,
+      cancellationRequestedAt: Date.now(),
     });
+
     await db.ref(`paymentHistory/${userId}`).push({
-      event: "cancelled_via_app",
+      event: "cancellation_requested",
       date:  Date.now(),
     });
+
+    await sendEmail(
+      userData.email,
+      "Subscription Cancellation Requested - MK2 Fitness",
+      `Hi,\n\nYour cancellation has been requested.\n\nYou will keep full access to your current plan until your billing period ends, after which you'll be moved to the Basic plan.\n\n- MK2 Team`
+    );
 
     res.json({ success: true });
 
@@ -640,7 +570,6 @@ app.listen(PORT, "0.0.0.0", () => {
       }
 
       const serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
-      // Normalise escaped newlines that some env providers encode
       serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, "\n");
 
       admin.initializeApp({
